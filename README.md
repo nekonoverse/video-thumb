@@ -34,6 +34,7 @@
 | `MIN_SEEK_SEC` | 1.0 | 最小シーク位置 (秒) |
 | `MAX_SEEK_SEC` | 10.0 | 最大シーク位置 (秒) |
 | `MAX_FILE_SIZE` | 524288000 | 最大ファイルサイズ (500MB) |
+| `UDS_PATH` | (未設定) | 設定時は TCP の代わりに Unix Domain Socket でリッスン |
 
 ## 起動
 

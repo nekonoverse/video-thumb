@@ -11,4 +11,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY main.py .
 
 EXPOSE 8005
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8005"]
+CMD ["sh", "-c", "if [ -n \"$UDS_PATH\" ]; then uvicorn main:app --uds \"$UDS_PATH\"; else uvicorn main:app --host 0.0.0.0 --port 8005; fi"]
