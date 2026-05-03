@@ -73,9 +73,30 @@ docker run -p 8005:8005 video-thumb
 
 ## 開発・テスト
 
+ユニットテスト (ffmpeg/ffprobe が必要):
+
 ```bash
 pip install -r requirements-dev.txt
 pytest
+```
+
+E2E テスト (Docker と稼働中コンテナを利用):
+
+```bash
+docker build -t video-thumb:test .
+docker run -d --name vt -p 8005:8005 \
+  -e ALLOW_PRIVATE_URL=1 \
+  --add-host=host.docker.internal:host-gateway \
+  video-thumb:test
+
+# 動画 fixture をホスト側で配信
+(cd tests/fixtures && python3 -m http.server 8765 &)
+
+E2E_BASE_URL=http://localhost:8005 \
+E2E_VIDEO_URL=http://host.docker.internal:8765/sample.mp4 \
+  pytest -m e2e tests/e2e/ -v
+
+docker rm -f vt
 ```
 
 ## nekonoverse との統合
