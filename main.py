@@ -258,14 +258,16 @@ def _url_input_args() -> list[str]:
 
     - protocol_whitelist: file:// 等の混入を遮断
     - rw_timeout: 読み取り/書き込みタイムアウト (μs)
-    - max_redirects 0: ffmpeg 自身のリダイレクト追従を無効化
-      (Python 側 HEAD で SSRF 検証した終端 URL から GET 時に別ホストへ
-      リダイレクトされる経路を塞ぐ)
+
+    NOTE: ffmpeg/ffprobe の HTTP demuxer に存在する `max_redirects` AVOption は
+    CLI からは設定不可 (ffmpeg 7.1 で `-max_redirects 0 → Option not found`)。
+    したがって ffmpeg 自身のリダイレクト追従を CLI 経由で無効化する手段は現状なく、
+    HEAD で検証した終端 URL から GET 時に別ホストへリダイレクトされる経路は
+    ffmpeg 側に委ねる形になる。READMEに残存リスクとして明示。
     """
     return [
         "-protocol_whitelist", "http,https,tcp,tls",
         "-rw_timeout", str(int(URL_FETCH_TIMEOUT * 1_000_000)),
-        "-max_redirects", "0",
     ]
 
 

@@ -246,18 +246,18 @@ def test_from_url_redirect_loop_limit(client, httpx_mock):
     assert r.status_code == 502
 
 
-def test_url_input_args_disables_ffmpeg_redirects():
-    """ffmpeg 自身のリダイレクト追従が無効化されている。
+def test_url_input_args_has_ssrf_guards():
+    """ffmpeg/ffprobe URL 入力時の SSRF 系ガードが付与されている。
 
-    Python 側 HEAD で SSRF 検証した終端 URL から、ffmpeg GET 時に Location で
-    別ホストへリダイレクトされる経路を塞ぐため -max_redirects 0 必須。
+    `-max_redirects` AVOption は CLI 不可 (ffmpeg 7.1: Option not found) のため
+    ffmpeg 自身のリダイレクト追従は無効化できない。Python 側 HEAD/GET 検証 +
+    protocol_whitelist + rw_timeout で防御する。
     """
     args = main._url_input_args()
-    # -max_redirects 0 が連続して含まれる
+    # protocol_whitelist で file:// 等を遮断
     pairs = list(zip(args, args[1:]))
-    assert ("-max_redirects", "0") in pairs
-    # SSRF 系の他のガードも維持されている
-    assert "-protocol_whitelist" in args
+    assert ("-protocol_whitelist", "http,https,tcp,tls") in pairs
+    # rw_timeout で時間ベースの上限を設定
     assert "-rw_timeout" in args
 
 

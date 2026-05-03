@@ -45,9 +45,15 @@ URL から動画を取得し、WebP サムネイルを返す。
 4. 確定した URL を `ffprobe` / `ffmpeg` に直接渡す。`-protocol_whitelist http,https,tcp,tls`、`-rw_timeout` (μs)、`-max_redirects 0` を必ず付与
 5. `-ss N -i URL` で HTTP Range シーク → 必要なフレーム周辺だけダウンロードしてサムネイル生成
 
-**SSRF 対策**: デフォルトでプライベート/ループバック/リンクローカル IP 宛の URL を拒否する。リダイレクト先も同様に検証される。ffmpeg 自身のリダイレクト追従も `-max_redirects 0` で無効化済み (HEAD で検証した終端 URL から GET 時に別ホストへ向けられる経路を遮断)。内部サービスからの利用などで許可したい場合は `ALLOW_PRIVATE_URL=1` を設定。
+**SSRF 対策**: Python 側で HEAD (または GET Range フォールバック) のリダイレクトを 1 ホップずつ追跡し、各ホップで `_validate_url` を再走させてプライベート/ループバック/リンクローカル IP を拒否する。内部サービスからの利用などで許可したい場合は `ALLOW_PRIVATE_URL=1` を設定。
 
-**残存リスク**: ffmpeg の HTTP GET レスポンスサイズに対する厳密な上限は存在せず、悪意サーバが HEAD で `Content-Length: 1` を申告して GET で大量バイトを流す攻撃には `URL_FETCH_TIMEOUT` (`-rw_timeout` の時間ベース) でしか防御できない。また DNS rebinding (HEAD と GET で異なる IP に解決される) に対しても完全な防御は実装されていない。これらは時間制限が許容できる用途 (内部 S3 連携など) を想定した設計。
+**残存リスク** (公開 URL を受け付ける用途では認識・許容するか別の対策が必要):
+
+- **ffmpeg 自身のリダイレクト追従**: ffmpeg 7.1 系では HTTP demuxer の `max_redirects` AVOption が CLI から設定不可 (`-max_redirects 0` → `Option not found`)。Python 側 HEAD で検証した終端 URL から、ffmpeg GET 時に Location で別ホストへ向けられる経路は塞げない。**信頼できる内部サービス (S3 等) からの利用を想定した設計**。
+- **DNS rebinding**: Python の HEAD で解決した IP と ffmpeg が独立に解決する IP が乖離する可能性。短 TTL DNS で意図的に切り替える攻撃には防御していない。
+- **GET レスポンスサイズの厳密な上限**: HEAD で `Content-Length: 1` を申告し GET で大量バイトを流す攻撃に対しては `URL_FETCH_TIMEOUT` (`-rw_timeout` の時間ベース) でしか防御できない。
+
+任意の公開 URL を受け付ける用途では `multipart /thumbnail` エンドポイント (呼び出し側でダウンロードと検証を制御) の利用を推奨。
 
 **レスポンス**: `/thumbnail` と同じ。
 
