@@ -13,6 +13,7 @@ URL からの動画取得は POST /thumbnail_from_url で行う。
   MAX_FILE_SIZE:      最大ファイルサイズ bytes (default: 500MB)
   ALLOW_PRIVATE_URL:  "1" でプライベートIP宛の URL を許可 (default: "0")
   URL_FETCH_TIMEOUT:  URL ダウンロード/IO タイムアウト 秒 (default: 60)
+  MAX_REDIRECTS:      HEAD リダイレクト追跡上限 (default: 5)
 """
 
 import asyncio
@@ -26,7 +27,6 @@ import socket
 import tempfile
 
 from contextlib import asynccontextmanager
-from typing import Optional
 from urllib.parse import urlparse
 
 import httpx
@@ -47,7 +47,7 @@ MAX_SEEK_SEC = float(os.environ.get("MAX_SEEK_SEC", "10.0"))
 MAX_FILE_SIZE = int(os.environ.get("MAX_FILE_SIZE", str(500 * 1024 * 1024)))
 ALLOW_PRIVATE_URL = os.environ.get("ALLOW_PRIVATE_URL", "0") == "1"
 URL_FETCH_TIMEOUT = float(os.environ.get("URL_FETCH_TIMEOUT", "60"))
-MAX_REDIRECTS = 5
+MAX_REDIRECTS = int(os.environ.get("MAX_REDIRECTS", "5"))
 
 _ffmpeg_ok: bool = False
 _ffprobe_ok: bool = False
@@ -82,12 +82,12 @@ app = FastAPI(title="video-thumb", lifespan=lifespan)
 
 class ThumbnailFromUrlRequest(BaseModel):
     url: str = Field(..., description="動画 URL (http/https のみ)")
-    max_dimension: Optional[int] = Field(
+    max_dimension: int | None = Field(
         default=None, description="サムネイル最大辺 (px)。環境変数 MAX_DIMENSION でキャップ"
     )
 
 
-def _resolve_max_dim(requested: Optional[int]) -> int:
+def _resolve_max_dim(requested: int | None) -> int:
     """リクエストされた max_dimension を環境変数値で上限キャップして返す。
 
     Raises:
@@ -100,14 +100,15 @@ def _resolve_max_dim(requested: Optional[int]) -> int:
     return min(requested, MAX_DIMENSION)
 
 
-def _is_public_host(host: str) -> bool:
+async def _is_public_host(host: str) -> bool:
     """ホスト名/IP がパブリック IP に解決されるか判定する。
 
     プライベート/ループバック/リンクローカル/予約済み IP は False を返す。
     解決された全てのアドレスがパブリックでなければ False。
     """
     try:
-        infos = socket.getaddrinfo(host, None)
+        loop = asyncio.get_running_loop()
+        infos = await loop.getaddrinfo(host, None)
     except socket.gaierror:
         return False
     for info in infos:
@@ -128,7 +129,7 @@ def _is_public_host(host: str) -> bool:
     return True
 
 
-def _validate_url(url: str) -> None:
+async def _validate_url(url: str) -> None:
     """URL を検証する。スキーム / ホスト / SSRF をチェック。
 
     Raises:
@@ -144,18 +145,44 @@ def _validate_url(url: str) -> None:
         )
     if not parsed.hostname:
         raise HTTPException(status_code=400, detail="URL にホスト名がありません")
-    if not ALLOW_PRIVATE_URL and not _is_public_host(parsed.hostname):
+    if not ALLOW_PRIVATE_URL and not await _is_public_host(parsed.hostname):
         raise HTTPException(
             status_code=400,
             detail="プライベート/ループバック IP 宛の URL は許可されていません",
         )
 
 
+def _extract_total_size(response: httpx.Response) -> int | None:
+    """レスポンスからファイル全体サイズを抽出する。
+
+    優先順:
+    1. Content-Range の 3 番目フィールド (Range レスポンス、`bytes 0-0/12345`)
+    2. Content-Length (HEAD や非 Range レスポンス)
+    """
+    cr = response.headers.get("content-range")
+    if cr:
+        parts = cr.rsplit("/", 1)
+        if len(parts) == 2 and parts[1] != "*":
+            try:
+                return int(parts[1])
+            except ValueError:
+                pass
+    cl = response.headers.get("content-length")
+    if cl is None:
+        return None
+    try:
+        return int(cl)
+    except ValueError:
+        return None
+
+
 async def _resolve_final_url(url: str) -> str:
     """HEAD でリダイレクトを追跡し、最終的な 200 OK の URL を返す。
 
-    各ホップで _validate_url を通し SSRF を防ぐ。Content-Length が
-    無い / MAX_FILE_SIZE を超えるサーバは 400 で拒否する。
+    各ホップで _validate_url を通し SSRF を防ぐ。HEAD が 403/405/501 を返す
+    サーバ (S3 presigned URL 等は HEAD が許可されないケースあり) には
+    `GET Range: bytes=0-0` でフォールバックし Content-Range からサイズ判定する。
+    Content-Length / Content-Range のどちらも取れない / MAX_FILE_SIZE 超過は 400。
 
     Returns:
         確定 URL (httpx.URL → str)
@@ -167,7 +194,7 @@ async def _resolve_final_url(url: str) -> str:
 
     async with httpx.AsyncClient(follow_redirects=False, timeout=timeout) as client:
         for _ in range(MAX_REDIRECTS + 1):
-            _validate_url(current)
+            await _validate_url(current)
             try:
                 r = await client.head(current)
             except httpx.TimeoutException:
@@ -177,6 +204,18 @@ async def _resolve_final_url(url: str) -> str:
                     status_code=502,
                     detail=f"URL 取得に失敗: {exc.__class__.__name__}",
                 )
+
+            # HEAD 不許可 (S3 presigned URL 等) → Range 1 byte GET にフォールバック
+            if r.status_code in (403, 405, 501):
+                try:
+                    r = await client.get(current, headers={"Range": "bytes=0-0"})
+                except httpx.TimeoutException:
+                    raise HTTPException(status_code=504, detail="URL 取得タイムアウト")
+                except httpx.RequestError as exc:
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"URL 取得に失敗: {exc.__class__.__name__}",
+                    )
 
             if r.is_redirect:
                 loc = r.headers.get("location")
@@ -191,21 +230,15 @@ async def _resolve_final_url(url: str) -> str:
                     detail=f"URL 取得失敗 (HTTP {r.status_code})",
                 )
 
-            cl = r.headers.get("content-length")
-            if cl is None:
+            total = _extract_total_size(r)
+            if total is None:
                 raise HTTPException(
                     status_code=400,
-                    detail="サーバが Content-Length を返さないため処理できません",
-                )
-            try:
-                total = int(cl)
-            except ValueError:
-                raise HTTPException(
-                    status_code=400, detail="Content-Length が不正"
+                    detail="サーバがサイズ情報 (Content-Length / Content-Range) を返さないため処理できません",
                 )
             if total <= 0:
                 raise HTTPException(
-                    status_code=400, detail="Content-Length が 0 以下"
+                    status_code=400, detail="ファイルサイズが 0 以下"
                 )
             if total > MAX_FILE_SIZE:
                 raise HTTPException(
@@ -225,10 +258,14 @@ def _url_input_args() -> list[str]:
 
     - protocol_whitelist: file:// 等の混入を遮断
     - rw_timeout: 読み取り/書き込みタイムアウト (μs)
+    - max_redirects 0: ffmpeg 自身のリダイレクト追従を無効化
+      (Python 側 HEAD で SSRF 検証した終端 URL から GET 時に別ホストへ
+      リダイレクトされる経路を塞ぐ)
     """
     return [
         "-protocol_whitelist", "http,https,tcp,tls",
         "-rw_timeout", str(int(URL_FETCH_TIMEOUT * 1_000_000)),
+        "-max_redirects", "0",
     ]
 
 
@@ -262,6 +299,12 @@ async def _probe_video(source: str, is_url: bool = False) -> dict:
         raise HTTPException(status_code=400, detail="ffprobe タイムアウト")
 
     if proc.returncode != 0:
+        if stderr:
+            logger.warning(
+                "ffprobe failed (rc=%d): %s",
+                proc.returncode,
+                stderr.decode(errors="replace")[:1000],
+            )
         raise HTTPException(status_code=400, detail="動画として解析できません")
 
     try:
@@ -331,6 +374,12 @@ async def _extract_frame(source: str, seek_sec: float, is_url: bool = False) -> 
         raise HTTPException(status_code=502, detail="ffmpeg タイムアウト")
 
     if proc.returncode != 0 or not stdout:
+        if stderr:
+            logger.warning(
+                "ffmpeg failed (rc=%d): %s",
+                proc.returncode,
+                stderr.decode(errors="replace")[:1000],
+            )
         raise HTTPException(status_code=502, detail="フレーム抽出に失敗")
 
     return stdout
@@ -388,7 +437,7 @@ def _make_response(webp: bytes, meta: dict) -> Response:
 @app.post("/thumbnail")
 async def create_thumbnail(
     file: UploadFile,
-    max_dimension: Optional[int] = Form(default=None),
+    max_dimension: int | None = Form(default=None),
 ) -> Response:
     """動画からサムネイル WebP を生成して返す。
 

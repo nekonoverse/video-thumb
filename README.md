@@ -40,13 +40,14 @@ URL から動画を取得し、WebP サムネイルを返す。
 **処理フロー**:
 
 1. Python が `HEAD` でリダイレクトを 200 OK まで追跡し、各ホップで SSRF 検証
-2. `Content-Length` が無い / `MAX_FILE_SIZE` を超えるサーバは **400 で拒否**
-3. 確定した URL を `ffprobe` / `ffmpeg` に直接渡す。`-protocol_whitelist http,https,tcp,tls` と `-rw_timeout` (μs) を必ず付与
-4. `-ss N -i URL` で HTTP Range シーク → 必要なフレーム周辺だけダウンロードしてサムネイル生成
+2. HEAD が `403/405/501` を返すサーバ (S3 presigned URL 等で起こる) には `GET Range: bytes=0-0` でフォールバックし `Content-Range` からサイズ判定
+3. `Content-Length` / `Content-Range` のどちらも取れない / `MAX_FILE_SIZE` を超えるサーバは **400 で拒否**
+4. 確定した URL を `ffprobe` / `ffmpeg` に直接渡す。`-protocol_whitelist http,https,tcp,tls`、`-rw_timeout` (μs)、`-max_redirects 0` を必ず付与
+5. `-ss N -i URL` で HTTP Range シーク → 必要なフレーム周辺だけダウンロードしてサムネイル生成
 
-**SSRF 対策**: デフォルトでプライベート/ループバック/リンクローカル IP 宛の URL を拒否する。リダイレクト先も同様に検証される。内部サービスからの利用などで許可したい場合は `ALLOW_PRIVATE_URL=1` を設定。
+**SSRF 対策**: デフォルトでプライベート/ループバック/リンクローカル IP 宛の URL を拒否する。リダイレクト先も同様に検証される。ffmpeg 自身のリダイレクト追従も `-max_redirects 0` で無効化済み (HEAD で検証した終端 URL から GET 時に別ホストへ向けられる経路を遮断)。内部サービスからの利用などで許可したい場合は `ALLOW_PRIVATE_URL=1` を設定。
 
-**サイズ判定**: HEAD レスポンスの `Content-Length` で事前判定する。サーバが `Content-Length` を返さない場合は処理できないため 400 を返す。
+**残存リスク**: ffmpeg の HTTP GET レスポンスサイズに対する厳密な上限は存在せず、悪意サーバが HEAD で `Content-Length: 1` を申告して GET で大量バイトを流す攻撃には `URL_FETCH_TIMEOUT` (`-rw_timeout` の時間ベース) でしか防御できない。また DNS rebinding (HEAD と GET で異なる IP に解決される) に対しても完全な防御は実装されていない。これらは時間制限が許容できる用途 (内部 S3 連携など) を想定した設計。
 
 **レスポンス**: `/thumbnail` と同じ。
 

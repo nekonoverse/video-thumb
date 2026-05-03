@@ -244,3 +244,121 @@ def test_from_url_redirect_loop_limit(client, httpx_mock):
         json={"url": "https://example.com/r0.mp4"},
     )
     assert r.status_code == 502
+
+
+def test_url_input_args_disables_ffmpeg_redirects():
+    """ffmpeg 自身のリダイレクト追従が無効化されている。
+
+    Python 側 HEAD で SSRF 検証した終端 URL から、ffmpeg GET 時に Location で
+    別ホストへリダイレクトされる経路を塞ぐため -max_redirects 0 必須。
+    """
+    args = main._url_input_args()
+    # -max_redirects 0 が連続して含まれる
+    pairs = list(zip(args, args[1:]))
+    assert ("-max_redirects", "0") in pairs
+    # SSRF 系の他のガードも維持されている
+    assert "-protocol_whitelist" in args
+    assert "-rw_timeout" in args
+
+
+def test_from_url_head_method_not_allowed_falls_back_to_get_range(client, httpx_mock):
+    """HEAD 405 (S3 presigned URL 等で起こりがち) のとき GET Range フォールバック。
+
+    Content-Range の `bytes 0-0/<total>` から全体サイズを抽出する。
+    """
+    # HEAD は 405
+    httpx_mock.add_response(
+        method="HEAD",
+        url="https://s3.example.com/v.mp4?sig=abc",
+        status_code=405,
+    )
+    # GET Range bytes=0-0 → 206 Partial Content
+    httpx_mock.add_response(
+        method="GET",
+        url="https://s3.example.com/v.mp4?sig=abc",
+        status_code=206,
+        headers={
+            "content-range": "bytes 0-0/12345678",
+            "content-length": "1",
+        },
+    )
+    resp = client.post(
+        "/thumbnail_from_url",
+        json={"url": "https://s3.example.com/v.mp4?sig=abc"},
+    )
+    assert resp.status_code == 200
+    assert resp.content == FAKE_WEBP
+
+
+def test_from_url_head_403_falls_back_to_get_range(client, httpx_mock):
+    """HEAD 403 でも GET Range にフォールバックする。"""
+    httpx_mock.add_response(
+        method="HEAD",
+        url="https://s3.example.com/v.mp4?sig=xyz",
+        status_code=403,
+    )
+    httpx_mock.add_response(
+        method="GET",
+        url="https://s3.example.com/v.mp4?sig=xyz",
+        status_code=206,
+        headers={"content-range": "bytes 0-0/9999"},
+    )
+    resp = client.post(
+        "/thumbnail_from_url",
+        json={"url": "https://s3.example.com/v.mp4?sig=xyz"},
+    )
+    assert resp.status_code == 200
+
+
+def test_from_url_head_405_get_too_large(client, httpx_mock):
+    """HEAD 405 → GET Range で得た Content-Range が上限超過 → 400。"""
+    httpx_mock.add_response(
+        method="HEAD",
+        url="https://s3.example.com/big.mp4",
+        status_code=405,
+    )
+    httpx_mock.add_response(
+        method="GET",
+        url="https://s3.example.com/big.mp4",
+        status_code=206,
+        headers={"content-range": f"bytes 0-0/{main.MAX_FILE_SIZE + 1}"},
+    )
+    r = client.post(
+        "/thumbnail_from_url",
+        json={"url": "https://s3.example.com/big.mp4"},
+    )
+    assert r.status_code == 400
+
+
+def test_extract_total_size_prefers_content_range():
+    """Content-Range と Content-Length が両方あるとき Content-Range を優先。"""
+    resp = httpx.Response(
+        status_code=206,
+        headers={
+            "content-range": "bytes 0-0/55555",
+            "content-length": "1",
+        },
+    )
+    assert main._extract_total_size(resp) == 55555
+
+
+def test_extract_total_size_falls_back_to_content_length():
+    """Content-Range が無いとき Content-Length を使う。"""
+    resp = httpx.Response(status_code=200, headers={"content-length": "777"})
+    assert main._extract_total_size(resp) == 777
+
+
+def test_extract_total_size_unknown_when_total_is_star():
+    """Content-Range の total が `*` のときは不明扱いで Content-Length にフォールバック。"""
+    resp = httpx.Response(
+        status_code=206,
+        headers={"content-range": "bytes 0-0/*", "content-length": "1"},
+    )
+    # */1 → unknown total → Content-Length 1 にフォールバック
+    assert main._extract_total_size(resp) == 1
+
+
+def test_extract_total_size_returns_none_when_neither():
+    """どちらのヘッダも無いとき None。"""
+    resp = httpx.Response(status_code=200)
+    assert main._extract_total_size(resp) is None
