@@ -12,7 +12,7 @@ URL からの動画取得は POST /thumbnail_from_url で行う。
   MAX_SEEK_SEC:       最大シーク位置 秒 (default: 10.0)
   MAX_FILE_SIZE:      最大ファイルサイズ bytes (default: 500MB)
   ALLOW_PRIVATE_URL:  "1" でプライベートIP宛の URL を許可 (default: "0")
-  URL_FETCH_TIMEOUT:  URL ダウンロードタイムアウト 秒 (default: 60)
+  URL_FETCH_TIMEOUT:  URL ダウンロード/IO タイムアウト 秒 (default: 60)
 """
 
 import asyncio
@@ -151,7 +151,88 @@ def _validate_url(url: str) -> None:
         )
 
 
-async def _probe_video(path: str) -> dict:
+async def _resolve_final_url(url: str) -> str:
+    """HEAD でリダイレクトを追跡し、最終的な 200 OK の URL を返す。
+
+    各ホップで _validate_url を通し SSRF を防ぐ。Content-Length が
+    無い / MAX_FILE_SIZE を超えるサーバは 400 で拒否する。
+
+    Returns:
+        確定 URL (httpx.URL → str)
+    Raises:
+        HTTPException: 検証失敗 / HTTP エラー / タイムアウト
+    """
+    current = url
+    timeout = httpx.Timeout(URL_FETCH_TIMEOUT)
+
+    async with httpx.AsyncClient(follow_redirects=False, timeout=timeout) as client:
+        for _ in range(MAX_REDIRECTS + 1):
+            _validate_url(current)
+            try:
+                r = await client.head(current)
+            except httpx.TimeoutException:
+                raise HTTPException(status_code=504, detail="URL 取得タイムアウト")
+            except httpx.RequestError as exc:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"URL 取得に失敗: {exc.__class__.__name__}",
+                )
+
+            if r.is_redirect:
+                loc = r.headers.get("location")
+                if not loc:
+                    raise HTTPException(status_code=502, detail="リダイレクト先が不明")
+                current = str(r.url.join(loc))
+                continue
+
+            if r.status_code >= 400:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"URL 取得失敗 (HTTP {r.status_code})",
+                )
+
+            cl = r.headers.get("content-length")
+            if cl is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="サーバが Content-Length を返さないため処理できません",
+                )
+            try:
+                total = int(cl)
+            except ValueError:
+                raise HTTPException(
+                    status_code=400, detail="Content-Length が不正"
+                )
+            if total <= 0:
+                raise HTTPException(
+                    status_code=400, detail="Content-Length が 0 以下"
+                )
+            if total > MAX_FILE_SIZE:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "ファイルサイズが上限"
+                        f" ({MAX_FILE_SIZE} bytes) を超えています"
+                    ),
+                )
+            return str(r.url)
+
+    raise HTTPException(status_code=502, detail="リダイレクト回数が上限を超えました")
+
+
+def _url_input_args() -> list[str]:
+    """URL を入力にするときの ffmpeg/ffprobe 共通引数。
+
+    - protocol_whitelist: file:// 等の混入を遮断
+    - rw_timeout: 読み取り/書き込みタイムアウト (μs)
+    """
+    return [
+        "-protocol_whitelist", "http,https,tcp,tls",
+        "-rw_timeout", str(int(URL_FETCH_TIMEOUT * 1_000_000)),
+    ]
+
+
+async def _probe_video(source: str, is_url: bool = False) -> dict:
     """ffprobe で動画のメタデータを取得する。
 
     Returns:
@@ -159,18 +240,23 @@ async def _probe_video(path: str) -> dict:
     Raises:
         HTTPException: ffprobe の実行失敗時
     """
-    proc = await asyncio.create_subprocess_exec(
-        "ffprobe",
+    args = ["ffprobe"]
+    if is_url:
+        args += _url_input_args()
+    args += [
         "-v", "quiet",
         "-print_format", "json",
         "-show_format",
         "-show_streams",
-        path,
+        source,
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
     try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
     except asyncio.TimeoutError:
         proc.kill()
         raise HTTPException(status_code=400, detail="ffprobe タイムアウト")
@@ -211,27 +297,35 @@ async def _probe_video(path: str) -> dict:
     }
 
 
-async def _extract_frame(path: str, seek_sec: float) -> bytes:
+async def _extract_frame(source: str, seek_sec: float, is_url: bool = False) -> bytes:
     """ffmpeg で指定位置のフレームを PNG として抽出する。
+
+    -ss を -i の前に置くことで HTTP Range シークが効き、URL 入力でも
+    必要箇所のみ取得される。
 
     Returns:
         PNG 画像バイナリ
     Raises:
         HTTPException: フレーム抽出失敗時
     """
-    proc = await asyncio.create_subprocess_exec(
-        "ffmpeg",
+    args = ["ffmpeg"]
+    if is_url:
+        args += _url_input_args()
+    args += [
         "-ss", str(seek_sec),
-        "-i", path,
+        "-i", source,
         "-frames:v", "1",
         "-f", "image2pipe",
         "-vcodec", "png",
         "pipe:1",
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
     try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
     except asyncio.TimeoutError:
         proc.kill()
         raise HTTPException(status_code=502, detail="ffmpeg タイムアウト")
@@ -255,15 +349,17 @@ def _to_webp(png_data: bytes, max_dim: int, quality: int) -> bytes:
     return buf.getvalue()
 
 
-async def _process_video(path: str, max_dim: int) -> tuple[bytes, dict]:
-    """動画ファイルをサムネイル WebP に変換する。
+async def _process_video(
+    source: str, max_dim: int, is_url: bool = False
+) -> tuple[bytes, dict]:
+    """動画ファイル/URL をサムネイル WebP に変換する。
 
     probe → frame extract → WebP の中核処理を共通化。
 
     Returns:
         (webp_bytes, meta dict)
     """
-    meta = await _probe_video(path)
+    meta = await _probe_video(source, is_url=is_url)
     duration = meta["duration"]
 
     if duration <= MIN_SEEK_SEC:
@@ -272,7 +368,7 @@ async def _process_video(path: str, max_dim: int) -> tuple[bytes, dict]:
         seek = min(max(duration * SEEK_PERCENT / 100, MIN_SEEK_SEC), MAX_SEEK_SEC)
         seek = min(seek, duration - 0.1)
 
-    png_data = await _extract_frame(path, seek)
+    png_data = await _extract_frame(source, seek, is_url=is_url)
     webp_data = _to_webp(png_data, max_dim, WEBP_QUALITY)
     return webp_data, meta
 
@@ -287,94 +383,6 @@ def _make_response(webp: bytes, meta: dict) -> Response:
             "X-Video-Height": str(meta["height"]),
         },
     )
-
-
-async def _download_to_tempfile(url: str) -> str:
-    """URL から動画をストリーミングダウンロードして一時ファイルに保存する。
-
-    リダイレクトは手動で追跡し、各ホップで SSRF 検証を行う。
-
-    Returns:
-        一時ファイルパス
-    Raises:
-        HTTPException: バリデーション/ダウンロード失敗
-    """
-    current_url = url
-    timeout = httpx.Timeout(URL_FETCH_TIMEOUT)
-
-    async with httpx.AsyncClient(follow_redirects=False, timeout=timeout) as client:
-        for _ in range(MAX_REDIRECTS + 1):
-            _validate_url(current_url)
-            try:
-                async with client.stream("GET", current_url) as resp:
-                    if resp.is_redirect:
-                        loc = resp.headers.get("location")
-                        if not loc:
-                            raise HTTPException(
-                                status_code=502, detail="リダイレクト先が不明"
-                            )
-                        current_url = str(resp.url.join(loc))
-                        continue
-                    if resp.status_code >= 400:
-                        raise HTTPException(
-                            status_code=502,
-                            detail=f"URL 取得失敗 (HTTP {resp.status_code})",
-                        )
-
-                    cl = resp.headers.get("content-length")
-                    if cl is not None:
-                        try:
-                            if int(cl) > MAX_FILE_SIZE:
-                                raise HTTPException(
-                                    status_code=400,
-                                    detail=(
-                                        "ファイルサイズが上限"
-                                        f" ({MAX_FILE_SIZE} bytes) を超えています"
-                                    ),
-                                )
-                        except ValueError:
-                            pass
-
-                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".video")
-                    size = 0
-                    try:
-                        async for chunk in resp.aiter_bytes(1024 * 1024):
-                            size += len(chunk)
-                            if size > MAX_FILE_SIZE:
-                                raise HTTPException(
-                                    status_code=400,
-                                    detail=(
-                                        "ファイルサイズが上限"
-                                        f" ({MAX_FILE_SIZE} bytes) を超えています"
-                                    ),
-                                )
-                            tmp.write(chunk)
-                        tmp.flush()
-                        tmp.close()
-                    except BaseException:
-                        tmp.close()
-                        try:
-                            os.unlink(tmp.name)
-                        except OSError:
-                            pass
-                        raise
-
-                    if size == 0:
-                        try:
-                            os.unlink(tmp.name)
-                        except OSError:
-                            pass
-                        raise HTTPException(status_code=400, detail="空のレスポンス")
-
-                    return tmp.name
-            except httpx.TimeoutException:
-                raise HTTPException(status_code=504, detail="URL 取得タイムアウト")
-            except httpx.RequestError as exc:
-                raise HTTPException(
-                    status_code=502, detail=f"URL 取得に失敗: {exc.__class__.__name__}"
-                )
-
-    raise HTTPException(status_code=502, detail="リダイレクト回数が上限を超えました")
 
 
 @app.post("/thumbnail")
@@ -416,7 +424,7 @@ async def create_thumbnail(
         if size == 0:
             raise HTTPException(status_code=400, detail="空のファイル")
 
-        webp, meta = await _process_video(tmp_path, max_dim)
+        webp, meta = await _process_video(tmp_path, max_dim, is_url=False)
         return _make_response(webp, meta)
 
     finally:
@@ -430,25 +438,18 @@ async def create_thumbnail(
 async def create_thumbnail_from_url(req: ThumbnailFromUrlRequest) -> Response:
     """URL から動画を取得してサムネイル WebP を生成して返す。
 
-    リクエスト (JSON):
-        url: 動画 URL (http / https)
-        max_dimension: 任意。環境変数 MAX_DIMENSION で上限キャップ
+    HEAD でリダイレクトを 200 OK まで追跡し、各ホップで SSRF 検証と
+    Content-Length チェックを行う。確定した URL を ffprobe / ffmpeg に
+    直接渡し、HTTP Range シークで必要箇所のみ取得する。
     """
     if not _ffmpeg_ok or not _ffprobe_ok:
         raise HTTPException(status_code=503, detail="FFmpeg が利用できません")
 
     max_dim = _resolve_max_dim(req.max_dimension)
-    _validate_url(req.url)
+    final_url = await _resolve_final_url(req.url)
 
-    tmp_path = await _download_to_tempfile(req.url)
-    try:
-        webp, meta = await _process_video(tmp_path, max_dim)
-        return _make_response(webp, meta)
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+    webp, meta = await _process_video(final_url, max_dim, is_url=True)
+    return _make_response(webp, meta)
 
 
 @app.get("/health")

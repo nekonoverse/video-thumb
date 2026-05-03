@@ -37,7 +37,16 @@ URL から動画を取得し、WebP サムネイルを返す。
 - `url` (必須): 動画 URL。スキームは `http` / `https` のみ許可
 - `max_dimension` (任意): サムネイル最大辺 (px)。環境変数 `MAX_DIMENSION` で上限キャップされる
 
+**処理フロー**:
+
+1. Python が `HEAD` でリダイレクトを 200 OK まで追跡し、各ホップで SSRF 検証
+2. `Content-Length` が無い / `MAX_FILE_SIZE` を超えるサーバは **400 で拒否**
+3. 確定した URL を `ffprobe` / `ffmpeg` に直接渡す。`-protocol_whitelist http,https,tcp,tls` と `-rw_timeout` (μs) を必ず付与
+4. `-ss N -i URL` で HTTP Range シーク → 必要なフレーム周辺だけダウンロードしてサムネイル生成
+
 **SSRF 対策**: デフォルトでプライベート/ループバック/リンクローカル IP 宛の URL を拒否する。リダイレクト先も同様に検証される。内部サービスからの利用などで許可したい場合は `ALLOW_PRIVATE_URL=1` を設定。
+
+**サイズ判定**: HEAD レスポンスの `Content-Length` で事前判定する。サーバが `Content-Length` を返さない場合は処理できないため 400 を返す。
 
 **レスポンス**: `/thumbnail` と同じ。
 
@@ -54,7 +63,7 @@ URL から動画を取得し、WebP サムネイルを返す。
 | `SEEK_PERCENT` | 10 | フレーム抽出位置 (動画の何%地点) |
 | `MIN_SEEK_SEC` | 1.0 | 最小シーク位置 (秒) |
 | `MAX_SEEK_SEC` | 10.0 | 最大シーク位置 (秒) |
-| `MAX_FILE_SIZE` | 524288000 | 最大ファイルサイズ (500MB) |
+| `MAX_FILE_SIZE` | 524288000 | 最大ファイルサイズ (500MB)。`/thumbnail_from_url` では HEAD の `Content-Length` で事前判定 |
 | `ALLOW_PRIVATE_URL` | (未設定) | `1` のとき `/thumbnail_from_url` でプライベート IP 宛 URL を許可 |
 | `URL_FETCH_TIMEOUT` | 60 | URL ダウンロードタイムアウト (秒) |
 | `UDS_PATH` | (未設定) | 設定時は TCP の代わりに Unix Domain Socket でリッスン |
