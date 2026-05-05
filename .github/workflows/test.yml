@@ -11,8 +11,12 @@ concurrency:
 
 jobs:
   unit:
-    name: Unit tests
-    runs-on: ubuntu-latest
+    name: Unit tests (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
@@ -34,9 +38,13 @@ jobs:
         run: pytest -v
 
   e2e:
-    name: E2E tests (Docker)
-    runs-on: ubuntu-latest
+    name: E2E tests (Docker, ${{ matrix.runner }})
     needs: unit
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
