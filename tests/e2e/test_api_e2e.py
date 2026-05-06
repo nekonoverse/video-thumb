@@ -35,6 +35,7 @@ def test_thumbnail_multipart(e2e_base_url, fixture_mp4):
     assert img.format == "WEBP"
     assert int(r.headers["X-Video-Width"]) == 320
     assert int(r.headers["X-Video-Height"]) == 240
+    assert r.headers.get("X-Video-Mimetype") == "video/mp4"
 
 
 def test_thumbnail_multipart_max_dimension(e2e_base_url, fixture_mp4):
@@ -58,6 +59,7 @@ def test_thumbnail_from_url(e2e_base_url, e2e_video_url):
     )
     assert r.status_code == 200, r.text
     assert r.headers["content-type"] == "image/webp"
+    assert r.headers.get("X-Video-Mimetype") == "video/mp4"
     img = _open_webp(r.content)
     assert img.format == "WEBP"
 

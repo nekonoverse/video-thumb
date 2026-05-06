@@ -52,6 +52,26 @@ MAX_REDIRECTS = int(os.environ.get("MAX_REDIRECTS", "5"))
 _ffmpeg_ok: bool = False
 _ffprobe_ok: bool = False
 
+# ffprobe の `format.format_name` → MIME タイプ。
+# 複数コンテナを区別しない値 (例: "mov,mp4,m4a,3gp,3g2,mj2") はそのままキーにする。
+_FORMAT_NAME_TO_MIME: dict[str, str] = {
+    "mov,mp4,m4a,3gp,3g2,mj2": "video/mp4",
+    "matroska,webm": "video/webm",
+    "avi": "video/x-msvideo",
+    "flv": "video/x-flv",
+    "mpegts": "video/mp2t",
+    "mpeg": "video/mpeg",
+    "ogg": "video/ogg",
+    "asf": "video/x-ms-asf",
+}
+
+
+def _format_name_to_mime(format_name: str | None) -> str | None:
+    """ffprobe の format_name から MIME タイプを引く。未マップは None。"""
+    if not format_name:
+        return None
+    return _FORMAT_NAME_TO_MIME.get(format_name)
+
 
 def _check_ffmpeg() -> bool:
     """ffmpeg の存在確認。"""
@@ -339,6 +359,7 @@ async def _probe_video(source: str, is_url: bool = False) -> dict:
         "duration": duration or 0.0,
         "width": width or 0,
         "height": height or 0,
+        "format_name": fmt.get("format_name"),
     }
 
 
@@ -425,14 +446,18 @@ async def _process_video(
 
 
 def _make_response(webp: bytes, meta: dict) -> Response:
+    headers = {
+        "X-Video-Duration": str(round(meta["duration"], 2)),
+        "X-Video-Width": str(meta["width"]),
+        "X-Video-Height": str(meta["height"]),
+    }
+    mime = _format_name_to_mime(meta.get("format_name"))
+    if mime:
+        headers["X-Video-Mimetype"] = mime
     return Response(
         content=webp,
         media_type="image/webp",
-        headers={
-            "X-Video-Duration": str(round(meta["duration"], 2)),
-            "X-Video-Width": str(meta["width"]),
-            "X-Video-Height": str(meta["height"]),
-        },
+        headers=headers,
     )
 
 
@@ -448,6 +473,7 @@ async def create_thumbnail(
         X-Video-Duration: 秒数 (float)
         X-Video-Width: 幅 (int)
         X-Video-Height: 高さ (int)
+        X-Video-Mimetype: 入力動画の MIME タイプ (判定可能な場合のみ)
     """
     if not _ffmpeg_ok or not _ffprobe_ok:
         raise HTTPException(status_code=503, detail="FFmpeg が利用できません")

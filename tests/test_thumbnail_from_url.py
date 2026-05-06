@@ -362,3 +362,59 @@ def test_extract_total_size_returns_none_when_neither():
     """どちらのヘッダも無いとき None。"""
     resp = httpx.Response(status_code=200)
     assert main._extract_total_size(resp) is None
+
+
+def test_format_name_to_mime_known():
+    assert main._format_name_to_mime("mov,mp4,m4a,3gp,3g2,mj2") == "video/mp4"
+    assert main._format_name_to_mime("matroska,webm") == "video/webm"
+    assert main._format_name_to_mime("avi") == "video/x-msvideo"
+
+
+def test_format_name_to_mime_unknown_returns_none():
+    assert main._format_name_to_mime(None) is None
+    assert main._format_name_to_mime("") is None
+    assert main._format_name_to_mime("totally_made_up") is None
+
+
+def test_from_url_includes_video_mimetype_header(httpx_mock, monkeypatch):
+    """_process_video が format_name を返せば X-Video-Mimetype が付与される。"""
+    monkeypatch.setattr(main, "_check_ffmpeg", lambda: True)
+    monkeypatch.setattr(main, "_check_ffprobe", lambda: True)
+    monkeypatch.setattr(main, "ALLOW_PRIVATE_URL", True)
+
+    async def stub(source, max_dim, is_url=False):
+        return FAKE_WEBP, {**FAKE_META, "format_name": "mov,mp4,m4a,3gp,3g2,mj2"}
+
+    monkeypatch.setattr(main, "_process_video", stub)
+    httpx_mock.add_response(
+        method="HEAD",
+        url="https://example.com/v.mp4",
+        headers={"content-length": "12345"},
+    )
+    with TestClient(main.app) as c:
+        r = c.post(
+            "/thumbnail_from_url",
+            json={"url": "https://example.com/v.mp4"},
+        )
+    assert r.status_code == 200
+    assert r.headers.get("X-Video-Mimetype") == "video/mp4"
+
+
+def test_from_url_omits_mimetype_header_when_unknown(client, httpx_mock, monkeypatch):
+    """format_name が未知 (またはマップに無い) のときヘッダは付かない。"""
+
+    async def stub(source, max_dim, is_url=False):
+        return FAKE_WEBP, {**FAKE_META, "format_name": "unknown_format_xyz"}
+
+    monkeypatch.setattr(main, "_process_video", stub)
+    httpx_mock.add_response(
+        method="HEAD",
+        url="https://example.com/v.mp4",
+        headers={"content-length": "12345"},
+    )
+    r = client.post(
+        "/thumbnail_from_url",
+        json={"url": "https://example.com/v.mp4"},
+    )
+    assert r.status_code == 200
+    assert "X-Video-Mimetype" not in r.headers

@@ -21,6 +21,7 @@
 - `X-Video-Duration`: 動画の長さ (秒)
 - `X-Video-Width`: 動画の幅 (px)
 - `X-Video-Height`: 動画の高さ (px)
+- `X-Video-Mimetype`: 入力動画の MIME タイプ (ffprobe の `format_name` から判定。未マップのフォーマットでは省略)
 
 ### `POST /thumbnail_from_url`
 
